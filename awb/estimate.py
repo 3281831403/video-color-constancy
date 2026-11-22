@@ -27,6 +27,8 @@ offline.
 
 from __future__ import annotations
 
+import math
+
 __all__ = [
     "apply_gains",
     "awb_batch",
@@ -37,6 +39,26 @@ __all__ = [
     "scene_correction",
     "validate",
 ]
+
+_KELVIN_MIN = 2000.0
+_KELVIN_MAX = 10000.0
+_REFERENCE_KELVIN = 6200.0
+_CURVE_SLOPE = 0.6
+_GAIN_FLOOR_DEFAULT = 0.25
+_GAIN_CEILING_DEFAULT = 4.0
+
+
+def _is_real(value) -> bool:
+    """Return True for finite real numbers (booleans excluded)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _valid_rgb_triple(pixel) -> bool:
+    return (
+        isinstance(pixel, (tuple, list))
+        and len(pixel) == 3
+        and all(_is_real(channel) for channel in pixel)
+    )
 
 
 def mean_rgb(img: list[tuple[float, float, float]]) -> tuple[float, float, float]:
@@ -53,7 +75,22 @@ def mean_rgb(img: list[tuple[float, float, float]]) -> tuple[float, float, float
     usable pixels remain, raise :class:`ValueError`.  The input is not mutated.
     Averages agree with the reference to an absolute tolerance of ``1e-9``.
     """
-    raise NotImplementedError
+    r_sum = g_sum = b_sum = 0.0
+    count = 0
+    for pixel in img:
+        if not _valid_rgb_triple(pixel):
+            raise ValueError("each pixel must be a finite (r, g, b) triple")
+        r, g, b = pixel
+        # Dead black (any 0.0) and clipped highlights (any 1.0) are excluded,
+        # along with anything outside the unit interval.
+        if 0.0 < r < 1.0 and 0.0 < g < 1.0 and 0.0 < b < 1.0:
+            r_sum += r
+            g_sum += g
+            b_sum += b
+            count += 1
+    if count == 0:
+        raise ValueError("no usable pixels remain after clipping exclusion")
+    return r_sum / count, g_sum / count, b_sum / count
 
 
 def gray_world_gains(mean: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -70,7 +107,12 @@ def gray_world_gains(mean: tuple[float, float, float]) -> tuple[float, float, fl
     ``mean_g`` while preserving green.  Non-positive or non-finite means raise
     :class:`ValueError`.
     """
-    raise NotImplementedError
+    if not _valid_rgb_triple(mean):
+        raise ValueError("mean must be a finite (r, g, b) triple")
+    mean_r, mean_g, mean_b = mean
+    if mean_r <= 0.0 or mean_g <= 0.0 or mean_b <= 0.0:
+        raise ValueError("channel means must be strictly positive")
+    return mean_g / mean_r, 1.0, mean_g / mean_b
 
 
 def kelvin_curve(kelvin: float) -> tuple[float, float, float]:
@@ -90,7 +132,12 @@ def kelvin_curve(kelvin: float) -> tuple[float, float, float]:
     Values outside the supported interval or non-finite values raise
     :class:`ValueError`.
     """
-    raise NotImplementedError
+    if not _is_real(kelvin) or not (_KELVIN_MIN <= kelvin <= _KELVIN_MAX):
+        raise ValueError("kelvin must be a finite CCT in [2000.0, 10000.0] K")
+    # A single smooth log-linear formula over the whole interval: there are no
+    # piecewise segments, so the curve cannot jump at interpolation knots.
+    u = math.log(kelvin / _REFERENCE_KELVIN)
+    return math.exp(-_CURVE_SLOPE * u), 1.0, math.exp(_CURVE_SLOPE * u)
 
 
 def estimate_kelvin(mean: tuple[float, float, float]) -> float:
@@ -106,7 +153,14 @@ def estimate_kelvin(mean: tuple[float, float, float]) -> float:
     The green mean does not affect the estimate.  Non-positive or non-finite
     means raise :class:`ValueError`.
     """
-    raise NotImplementedError
+    if not _valid_rgb_triple(mean):
+        raise ValueError("mean must be a finite (r, g, b) triple")
+    mean_r, _mean_g, mean_b = mean
+    if mean_r <= 0.0 or mean_b <= 0.0:
+        raise ValueError("red and blue means must be strictly positive")
+    # Log-space inversion of the log-linear curve: the R/B ratio maps
+    # monotonically onto CCT instead of being compressed into a linear range.
+    return _REFERENCE_KELVIN * (mean_b / mean_r) ** (5.0 / 6.0)
 
 
 def apply_gains(
@@ -126,7 +180,24 @@ def apply_gains(
     and non-positive or non-finite gains raise :class:`ValueError`.  Values
     agree with the reference to an absolute tolerance of ``1e-9``.
     """
-    raise NotImplementedError
+    if not _valid_rgb_triple(gains):
+        raise ValueError("gains must be a finite (g_r, g_g, g_b) triple")
+    if any(gain <= 0.0 for gain in gains):
+        raise ValueError("gains must be strictly positive")
+    g_r, g_g, g_b = gains
+    corrected = []
+    for pixel in img:
+        if not _valid_rgb_triple(pixel):
+            raise ValueError("each pixel must be a finite (r, g, b) triple")
+        r, g, b = pixel
+        corrected.append(
+            (
+                min(1.0, max(0.0, r * g_r)),
+                min(1.0, max(0.0, g * g_g)),
+                min(1.0, max(0.0, b * g_b)),
+            )
+        )
+    return corrected
 
 
 def scene_correction(
@@ -153,7 +224,34 @@ def scene_correction(
     correction gains.  Unknown keys are ignored.  Invalid bounds raise
     :class:`ValueError`.  The frame itself is never modified.
     """
-    raise NotImplementedError
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("config must be a mapping")
+    gain_floor = config.get("gain_floor", _GAIN_FLOOR_DEFAULT)
+    gain_ceiling = config.get("gain_ceiling", _GAIN_CEILING_DEFAULT)
+    if (
+        not _is_real(gain_floor)
+        or not _is_real(gain_ceiling)
+        or gain_floor <= 0.0
+        or gain_ceiling <= 0.0
+        or gain_floor > gain_ceiling
+    ):
+        raise ValueError("invalid gain_floor/gain_ceiling bounds")
+
+    # 1. Statistics on the untouched original frame.
+    mean = mean_rgb(img)
+    # 2. Kelvin estimated from the original statistics, before any correction.
+    kelvin = estimate_kelvin(mean)
+    # 3. White-point weights at the estimated CCT.  Clamp the query into the
+    # supported interval so extreme scenes still produce a finite curve.
+    curve_kelvin = min(_KELVIN_MAX, max(_KELVIN_MIN, kelvin))
+    w_r, _w_g, w_b = kelvin_curve(curve_kelvin)
+    # 4. Reciprocal weights correct the cast; green stays anchored at exactly
+    # 1.0, then the configured safety bounds clamp red and blue.
+    g_r = min(gain_ceiling, max(gain_floor, 1.0 / w_r))
+    g_b = min(gain_ceiling, max(gain_floor, 1.0 / w_b))
+    return {"gains": (g_r, 1.0, g_b), "kelvin": kelvin}
 
 
 def validate(
@@ -175,7 +273,29 @@ def validate(
     ``"gains_range"`` and ``"gain_product"``.  The function does not raise for
     invalid content and does not mutate its arguments.
     """
-    raise NotImplementedError
+    errors: list[str] = []
+
+    if len(img) == 0:
+        errors.append("image_empty")
+    elif not all(isinstance(pixel, (tuple, list)) and len(pixel) == 3 for pixel in img):
+        errors.append("image_channels")
+    elif not all(_is_real(channel) for pixel in img for channel in pixel):
+        errors.append("image_nan")
+    elif not all(0.0 <= channel <= 1.0 for pixel in img for channel in pixel):
+        errors.append("image_range")
+
+    if not isinstance(gains, (tuple, list)) or len(gains) != 3:
+        errors.append("gains_channels")
+    elif not all(_is_real(gain) for gain in gains):
+        errors.append("gains_nan")
+    else:
+        if not all(0.25 <= gain <= 4.0 for gain in gains):
+            errors.append("gains_range")
+        # Product is only meaningful once three finite gains exist.
+        if abs(gains[0] * gains[1] * gains[2] - 1.0) > 0.01:
+            errors.append("gain_product")
+
+    return errors
 
 
 def awb_batch(
@@ -195,4 +315,5 @@ def awb_batch(
     are not mutated and frame order is preserved.  Errors raised by
     :func:`scene_correction` propagate; no partial result is returned.
     """
-    raise NotImplementedError
+    results = [scene_correction(frame, config) for frame in frames]
+    return {"results": results, "count": len(results)}
